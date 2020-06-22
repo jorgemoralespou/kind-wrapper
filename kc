@@ -1,0 +1,286 @@
+#!/bin/bash
+#
+# kc: Kind cluster
+#
+DOC="https://github.com/openshift-evangelists/oc-cluster-wrapper/blob/master/README.adoc"
+SCRIPT_NAME=$(basename "$0")
+KIND_BIN='/usr/local/bin/kind'
+
+# Handle source locations that might be a symlink (ref: http://bit.ly/2kcvSCS)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+  DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+
+
+KC_HOME=$HOME/.kc
+KC_PROFILES_HOME=$KC_HOME/profiles
+# Create KC_HOME if it doesn't exist
+[ ! -d $KC_HOME ] && mkdir $KC_HOME
+[ ! -d $KC_PROFILES_HOME ] && mkdir $KC_PROFILES_HOME
+
+
+# DEFAULTS:
+__VERSION="1.18.2"
+
+# Commands:
+#
+# kc up [<name>]
+# kc down [<name>]
+# kc status [<name>]
+# kc list
+# kc delete [<name>]
+
+
+#########
+#
+# kc up <cluster-name> --options
+#
+#
+#
+function up {
+  [ "$1" == "-h" ] || [ "$1" == "--help" ] && ${FUNCNAME[0]}.help && return 0
+
+  local _profile="$1"
+  #TODO: Check that cluster with name is not already running
+#  status &> /dev/null && error_exit "There is a cluster already running. You can not run 2 cluster at the same time"
+
+  if [ "$_profile" == "" ] || [[ "$_profile" == -* ]]
+  then
+    _profile="kind"
+    echo "[INFO] Using default profile: ${_profile}"
+  else
+    shift # Remove profile name
+  fi
+
+  # Parse supported command line, and detect duplicates
+  while [ "${1+defined}" ]; do
+    local _key=$1
+    case $_key in
+      --version=*|-v=*)
+        [ ! -z "$__PARM_VERSION" ] && echo "Parameter ${_key%=*} has already been set. Remove the duplicate occurence" && exit 1
+        __PARM_VERSION="${_key#*=}"
+        shift # past argument
+        ;;
+      --version|-v)
+        [ ! -z "$__PARM_VERSION" ] && echo "Parameter $_key has already been set. Remove the duplicate occurence" && exit 1
+        __PARM_VERSION="$2"
+        shift 2; # past argument
+        ;;
+      *)  
+        echo "Parameter $_key not supported. It will not be used"
+        shift
+        ;;
+    esac
+  done
+
+  # TODO: Make selection of "cluster configs/profiles". By default it will be basic
+  local CLUSTER_CONFIG="basic"
+
+  # Build command line
+  # Test if profile file exists, and if not, create it
+  local CMDLINE=""
+  if [ ! -e "$KC_PROFILES_HOME/${_profile}.yaml" ]; then
+    # Create profile file
+    PROCESSED_TEMPLATE=$(ytt -v name=${_profile} -f $DIR/internal/$CLUSTER_CONFIG.yaml -f $DIR/internal/values.yaml > $KC_PROFILES_HOME/${_profile}.yaml)
+    RET_VALUE=$?
+    [ "$RET_VALUE" != 0 ] && echo "[ERROR] Creating cluster configuration" && return 1
+    echo "[INFO] Cluster config created in $KC_PROFILES_HOME/${_profile}.yaml)"
+    # TODO: Once 0.9.0 is out and kind config can provide a name, remove the argument
+    CMDLINE="${KIND_BIN} create cluster --name=${_profile} --config=$KC_PROFILES_HOME/${_profile}.yaml"
+  else
+    CMDLINE="docker start ${_profile}-control-plane"
+    kubectl config use-context kind-${_profile}
+  fi
+  
+##  [ ! -z "$__PARM_VERSION" ] && CMDLINE+=" --version $__PARM_VERSION" || CMDLINE+=" --version $__VERSION"
+
+  echo "[INFO] $CMDLINE"
+  echo "[INFO] Cluster name is not yet supported in 0.8.1"
+  eval "$CMDLINE"
+
+  return 0
+}
+
+function up.help {
+  echo "Starts/Creates a cluster with the given profile name (or default)"
+  echo "in case no profile is specified"
+  echo ""
+  echo "Profile information will be stored in $OPENSHIFT_PROFILES_DIR/<PROFILE>"
+  echo ""
+  echo "Usage:"
+  echo " $SCRIPT_NAME up [<profile>] [<args>]"
+  echo ""
+  echo "Available Environement variables:"
+  echo ""
+  echo "ROUTING_SUFFIX (defaults to apps.127.0.0.1.nip.io)"
+  echo ""
+  echo "Available Arguments:"
+  echo ""
+  echo ""
+  echo "See the documentation at $DOC"
+}
+
+function down {
+  [ "$1" == "-h" ] || [ "$1" == "--help" ] && ${FUNCNAME[0]}.help && return 0
+
+  local _profile="$1"
+  #TODO: Check that cluster with name is not already running
+#  status &> /dev/null && error_exit "There is a cluster already running. You can not run 2 cluster at the same time"
+
+  if [ "$_profile" == "" ] || [[ "$_profile" == -* ]]
+  then
+    _profile="kind"
+    echo "[INFO] Using default profile: ${_profile}"
+  else
+    shift # Remove profile name
+  fi
+
+  docker stop ${_profile}-control-plane
+  kubectl config unset current-context 
+}
+
+function down.help {
+  echo "Stops the current active cluster. No information will be removed"
+  echo "so the cluster can be later started again"
+  echo ""
+  echo "Usage:"
+  echo " $SCRIPT_NAME down"
+  echo ""
+  echo "See the documentation at $DOC"
+}
+
+#
+# Args:
+#  $1: [-s] silent
+function status {
+  [ "$1" == "-h" ] || [ "$1" == "--help" ] && ${FUNCNAME[0]}.help && return 0
+
+  [[ "$(docker ps -f name=origin -q)" == "" ]] && echo "no cluster running" && return 1
+  echo "oc cluster running. Current profile <$([ -f $OPENSHIFT_HOME_DIR/active_profile ] && cat $OPENSHIFT_HOME_DIR/active_profile || echo 'unknown')>"
+  ${OC_BINARY} cluster status
+
+  return 0
+}
+
+function status.help {
+  echo "Displays status information about the active cluster/profile"
+  echo ""
+  echo "Usage:"
+  echo " $SCRIPT_NAME status"
+  echo ""
+  echo "See the documentation at $DOC"
+}
+
+# If the cluster is up, it will bring it down and delete active_profile
+# Otherwise will ask for profile
+function delete {
+  # TODO: Make proper argument removal
+  [ "$1" == "-h" ] || [ "$1" == "--help" ] && ${FUNCNAME[0]}.help && return 0
+  [ "$1" == "-c" ] || [ "$1" == "--confirm" ] && CONFIRM=true && shift
+
+  local _profile="$1"
+  #TODO: Check that cluster with name is not already running
+#  status &> /dev/null && error_exit "There is a cluster already running. You can not run 2 cluster at the same time"
+
+  if [ "$_profile" == "" ] || [[ $_profile == -* ]]
+  then
+    _profile="kind"
+    echo "[INFO] Using default profile: ${_profile}"
+  else
+    shift # Remove profile name
+  fi
+  
+  echo "[INFO] ${KIND_BIN} delete cluster --name ${_profile}"
+  ${KIND_BIN} delete cluster --name ${_profile}
+  rm -rf $KC_PROFILES_HOME/${_profile}.yaml
+}
+
+function delete.help {
+  echo "Deletes the specified cluster, or the current active cluster"
+  echo "if none is specified. Use -c/--confirm to skip confirmation prompt"
+  echo ""
+  echo "All the information store for the profile will be removed"
+  echo "- This information is stored in $OPENSHIFT_PROFILES_DIR/<PROFILE>"
+  echo "- Also the profile will be cleared from the .kubeconfig file"
+  echo "- All the images created by this cluster will be removed"
+  echo ""
+  echo "Usage:"
+  echo " $SCRIPT_NAME destroy [-c || --confirm] [<PROFILE>]"
+  echo ""
+  echo "See the documentation at $DOC"
+}
+
+function list {
+  [ "$1" == "-h" ] || [ "$1" == "--help" ] && ${FUNCNAME[0]}.help && return 0
+
+  echo "Profiles:"
+  for cluster in $(${KIND_BIN} get clusters)
+  do
+    echo "- ${cluster}"
+  done
+}
+
+function list.help {
+  echo "List all the available profiles"
+  echo ""
+  echo "Profiles are located in $OPENSHIFT_PROFILES_DIR"
+  echo ""
+  echo "Usage:"
+  echo " $SCRIPT_NAME list"
+  echo ""
+  echo "See the documentation at $DOC"
+}
+
+function help {
+  echo "Usage:"
+  echo " $SCRIPT_NAME -h"
+  echo ""
+  echo "Available Commands:"
+  echo ""
+  echo "  $SCRIPT_NAME up [profile] [OPTIONS]"
+  echo "  $SCRIPT_NAME down"
+  echo "  $SCRIPT_NAME delete [profile]"
+  echo "  $SCRIPT_NAME list"
+  echo "  $SCRIPT_NAME status"
+  echo ""
+  echo "See the documentation at $DOC"
+}
+
+# Use -gt 1 to consume two arguments per pass in the loop (e.g. each
+# argument has a corresponding value to go with it).
+# Use -gt 0 to consume one or more arguments per pass in the loop (e.g.
+# some arguments don't have a corresponding value to go with it such
+# as in the --default example).
+if [[ $# -gt 0 ]]
+then
+   key="$1"
+   case $key in
+      up)
+        shift # past argument
+        up "$@"
+        ;;
+      down)
+        shift # past argument
+        down "$@"
+        ;;
+      delete)
+        shift # past argument
+        delete "$@"
+        ;;
+      list)
+        list
+        ;;
+      status)
+        status
+        ;;
+      -h|--help)
+        help
+        ;;
+   esac
+else
+   help
+fi
