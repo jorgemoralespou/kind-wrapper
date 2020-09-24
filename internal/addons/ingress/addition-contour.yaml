@@ -1,0 +1,16 @@
+#@ load("@ytt:data", "data")
+#@ load("@ytt:overlay", "overlay")
+
+#@overlay/match by=overlay.subset({"kind": "DaemonSet"})
+---
+spec:
+  template:
+    spec:
+      #@overlay/match missing_ok=True
+      nodeSelector:
+        ingress-ready: "true"
+      #@overlay/match missing_ok=True
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator": "Equal"
+          effect": "NoSchedule"
